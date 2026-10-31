@@ -8,19 +8,23 @@ from .vendored import uhid
 from .vendored.dbus_fast import DBusError
 
 from .CMD import CTAPHID_CAPABILITIES, CTAPHID_CMD, CTAPBLE_CMD
-from .CTAPBLEDevice import CTAPBLEDevice
+from .CTAPBLEDevice import CTAPBLEDevice, DeviceUnavailableError
 
 # noinspection SpellCheckingInspection
 CTAPHID_BROADCAST_CHANNEL = 0xFFFFFFFF
+
+DEFAULT_CONNECT_ATTEMPTS = 2
+"""How many times to try (re)connecting the BLE link for one HID request."""
 
 
 class CTAPHIDDevice:
     device: uhid.UHIDDevice
     ble_device: CTAPBLEDevice
-    channels_to_state: dict[int, bytes] = {}
-    active_tasks: list = []
+    channels_to_state: dict[int, bytes]
+    active_tasks: list
     timeout_task = None
     active_channel: int
+    stopped = False
 
     hid_packet_size: int = 64
     channel: int = 0
@@ -38,9 +42,17 @@ class CTAPHIDDevice:
     reference_count = 0
     """Number of open handles to the device: clear state when it hits zero."""
 
-    def __init__(self, ble_device):
+    def __init__(self, ble_device, connect_attempts: int = DEFAULT_CONNECT_ATTEMPTS):
         # This could then also include the proper name, VID, PID and so on
         self.ble_device = ble_device
+        self.connect_attempts = max(1, connect_attempts)
+        # Per-device state. These used to be class attributes, i.e. shared
+        # between all proxied devices.
+        self.channels_to_state = {}
+        self.active_tasks = []
+        self.timeout_task = None
+        self.active_channel = 0
+        self.stopped = False
         addr = ble_device.device_id.split("_")[1:]
         vid = int("".join(addr[0:2]), 16)
         pid = int("".join(addr[2:4]), 16)
@@ -100,6 +112,27 @@ class CTAPHIDDevice:
     async def start(self):
         await self.device.wait_for_start_asyncio()
 
+    def stop(self):
+        """Tear down the HID device and abort any work in flight.
+
+        Called when the BLE device is unpaired or removed from BlueZ, so that no
+        task keeps trying to reconnect to a device that no longer exists.
+        """
+        if self.stopped:
+            return
+        self.stopped = True
+        self.ble_device.mark_unavailable()
+        for task in self.active_tasks:
+            if not task.done():
+                task.cancel()
+        self.active_tasks = []
+        if self.timeout_task and not self.timeout_task.done():
+            self.timeout_task.cancel()
+        try:
+            self.device.destroy()
+        except Exception as error:
+            logging.warning(f"Error destroying uhid device: {error}")
+
     def process_open(self):
         self.reference_count += 1
 
@@ -143,7 +176,7 @@ class CTAPHIDDevice:
                 )
                 # Failed to connect, we abort now
                 return
-            except DBusError as dbusError:
+            except (DBusError, DeviceUnavailableError) as dbusError:
                 logging.warning(
                     f"Unable to connect to {self.ble_device.device_id}, error: {dbusError}"
                 )
@@ -170,7 +203,7 @@ class CTAPHIDDevice:
                 )
                 # Failed to connect, we abort now
                 return
-            except DBusError as dbusError:
+            except (DBusError, DeviceUnavailableError) as dbusError:
                 logging.warning(
                     f"Unable to connect to {self.ble_device.device_id}, error: {dbusError}"
                 )
@@ -249,18 +282,43 @@ class CTAPHIDDevice:
                 )
             )
 
+    async def ensure_connected(self) -> CTAPBLEDevice | None:
+        """Return the connected BLE device, reconnecting a bounded number of times.
+
+        Returns None when the device could not be reached. Stops immediately when
+        the device has been unpaired or removed from BlueZ instead of retrying
+        forever (issue #33).
+        """
+        for attempt in range(self.connect_attempts):
+            connected = self.ble_device.get_connected_ble()
+            if connected is not None:
+                return connected
+            if attempt > 0:
+                await asyncio.sleep(1)  # Wait before retrying
+            logging.debug(
+                f"Reconnect to device {self.ble_device.device_id} (attempt {attempt + 1}/{self.connect_attempts})"
+            )
+            try:
+                await self.ble_device.reconnect()
+            except DeviceUnavailableError:
+                logging.info(
+                    f"Device {self.ble_device.device_id} is gone, not reconnecting"
+                )
+                return None
+            except Exception as error:
+                logging.warning(f"Reconnect failed: {error}")
+        connected = self.ble_device.get_connected_ble()
+        if connected is None:
+            logging.warning(
+                f"Giving up on {self.ble_device.device_id} after {self.connect_attempts} connection attempts"
+            )
+        return connected
+
     async def hid_finish_receiving(self, channel):
         try:
-            connected_ble_device: CTAPBLEDevice = self.ble_device.get_connected_ble()
-            while connected_ble_device is None:
-                logging.debug("Reconnect to device")
-                try:
-                    await self.ble_device.reconnect()
-                except Exception as error:
-                    logging.warning(f"Reconnect failed: {error}")
-
-                await asyncio.sleep(1)  # Wait before retrying
-                connected_ble_device = self.ble_device.get_connected_ble()
+            connected_ble_device = await self.ensure_connected()
+            if connected_ble_device is None:
+                return
             self.setup_timeout()
 
             if self.hid_command == CTAPHID_CMD.CBOR:

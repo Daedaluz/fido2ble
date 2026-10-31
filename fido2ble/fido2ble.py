@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+from functools import partial
 
 from .vendored.dbus_fast import BusType
 from .vendored.dbus_fast.aio import MessageBus
@@ -23,10 +24,43 @@ fido_devices: dict[str, CTAPBLEDevice]
 hid_devices: dict[str, CTAPHIDDevice]
 
 
-async def properties_changed(interface, changed, invalidated):
+async def device_properties_changed(path, interface, changed, invalidated):
     """Handles property changes for Bluetooth devices."""
     if interface == DEVICE_INTERFACE and "Paired" in changed:
-        await update_fido_devices()
+        if changed["Paired"].value:
+            await update_fido_devices()
+        else:
+            remove_device(path)
+
+
+watched_paths: set[str] = set()
+
+
+def watch_device_properties(bus, device_path, device_proxy):
+    """Follow pairing state of a device so it can be added/removed while running."""
+    if device_path in watched_paths:
+        return
+    props = device_proxy.get_interface(PROPERTIES_INTERFACE)
+    props.on_properties_changed(partial(device_properties_changed, device_path))
+    watched_paths.add(device_path)
+
+
+def remove_device(path):
+    """Forget a device that was unpaired or removed from BlueZ.
+
+    Stops its HID proxy and any task that would otherwise keep reconnecting to
+    it (issue #33). Safe to call more than once.
+    """
+    ble = fido_devices.pop(path, None)
+    hid = hid_devices.pop(path, None)
+    if ble is None and hid is None:
+        return
+    if ble is not None:
+        ble.mark_unavailable()
+        ble.remove_signal_handler()
+    if hid is not None:
+        hid.stop()
+    logging.info(f"Device Removed: {path}")
 
 
 async def interfaces_added(path, interfaces, bus):
@@ -42,19 +76,16 @@ async def interfaces_added(path, interfaces, bus):
                     obj = bus.get_proxy_object(
                         "org.bluez", path, await bus.introspect("org.bluez", path)
                     )
-                    props = obj.get_interface(PROPERTIES_INTERFACE)
-                    props.on_properties_changed(properties_changed)
+                    watch_device_properties(bus, path, obj)
+                    if path not in fido_devices and device1_interface.get("Paired") and device1_interface["Paired"].value:
+                        await update_fido_devices()
 
 
 async def interfaces_removed(path, interfaces):
     """Handles removed interfaces (e.g., Bluetooth device lost/disconnected)."""
     if DEVICE_INTERFACE in interfaces:
-        if path in fido_devices:
-            fido_devices[path].remove_signal_handler()
-            del fido_devices[path]
-            hid_devices[path].device.destroy()
-            del hid_devices[path]
-            logging.info(f"Device Removed: {path}")
+        watched_paths.discard(path)
+        remove_device(path)
 
 
 async def monitor_bluez():
@@ -82,6 +113,9 @@ async def create_device(device_path, dbus_managed_objects, bus) -> CTAPBLEDevice
         "org.bluez", device_path, await bus.introspect("org.bluez", device_path)
     )
     device1 = device_proxy.get_interface("org.bluez.Device1")
+    # Devices present at startup never went through interfaces_added, so make
+    # sure unpairing them is noticed too.
+    watch_device_properties(bus, device_path, device_proxy)
     cached = False
     for key in dbus_managed_objects:
         if key.startswith(device_path + "/"):

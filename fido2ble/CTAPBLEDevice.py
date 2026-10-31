@@ -47,13 +47,28 @@ async def find_characteristics(device_path, objects, characteristic_paths):
 
 DEFAULT_TIMEOUT = 3000  # milliseconds
 
+# D-Bus errors BlueZ returns once a device object has been removed (for example
+# after `bluetoothctl remove`). Retrying against such a path can never succeed.
+DEVICE_GONE_ERRORS = (
+    "org.freedesktop.DBus.Error.UnknownMethod",
+    "org.freedesktop.DBus.Error.UnknownObject",
+    "org.freedesktop.DBus.Error.UnknownInterface",
+)
+
+
+class DeviceUnavailableError(Exception):
+    """The BLE device has been unpaired or removed from BlueZ."""
+
 
 class CTAPBLEDevice:
     device1_interface: ProxyInterface  # org.bluez.Device1
     device_id: str
     connected = False
+    available = True
+    """False once the device has been unpaired or removed from BlueZ."""
     timeout = DEFAULT_TIMEOUT
     cached = False
+    notify_handler_registered = False
 
     fido_control_point_path: str
     fido_control_point: ProxyInterface  # org.bluez.GattCharacteristic1
@@ -91,11 +106,26 @@ class CTAPBLEDevice:
         self.fido_control_point_length_path = control_point_length_path
         self.fido_status_path = status_path
         self.connected = False
+        self.available = True
         self.device_properties_interface = self.device_proxy.get_interface(
             "org.freedesktop.DBus.Properties"
         )
 
+    def mark_unavailable(self):
+        """Forget the device: it was unpaired or removed from BlueZ."""
+        if self.available:
+            logging.info(f"Device {self.device_id} is no longer available")
+        self.available = False
+        self.connected = False
+
+    def _raise_if_gone(self, error: DBusError):
+        if error.type in DEVICE_GONE_ERRORS:
+            self.mark_unavailable()
+            raise DeviceUnavailableError(self.device_id) from error
+
     async def connect(self, handler):
+        if not self.available:
+            raise DeviceUnavailableError(self.device_id)
         if self.connected:
             return self
 
@@ -192,14 +222,25 @@ class CTAPBLEDevice:
         return self
 
     async def reconnect(self):
+        """Re-establish the BLE link of a device that was connected before.
+
+        Raises DeviceUnavailableError when the device is gone from BlueZ (so
+        callers stop retrying) and DBusError for transient failures.
+        """
+        if not self.available:
+            raise DeviceUnavailableError(self.device_id)
         try:
             # noinspection PyUnresolvedReferences
             await self.device1_interface.call_connect()
-        except Exception as error:
+        except DBusError as error:
+            self._raise_if_gone(error)
             logging.warning(f"Unable to reconnect to {self.device_id}, error: {error}")
+            raise
+        self.connected = True
         try:
             await self.listen_to_notify()
-        except Exception as error:
+        except DBusError as error:
+            self._raise_if_gone(error)
             logging.warning(
                 f"Unable to listen to notify when reconnecting to {self.device_id}, error: {error}"
             )
@@ -208,27 +249,38 @@ class CTAPBLEDevice:
         if self.connected:
             self.connected = False  # Has to be here to avoid sending messages while waiting for disconnect to finish
             logging.debug(f"Disconnecting: {self.device_id}")
-            # noinspection PyUnresolvedReferences
-            await self.fido_status.call_stop_notify()
-            # noinspection PyUnresolvedReferences
-            await self.device1_interface.call_disconnect()
-        # noinspection PyUnresolvedReferences
-        self.fido_status_notify_listen.off_properties_changed(self.handler)
+            try:
+                # noinspection PyUnresolvedReferences
+                await self.fido_status.call_stop_notify()
+                # noinspection PyUnresolvedReferences
+                await self.device1_interface.call_disconnect()
+            except DBusError as error:
+                logging.debug(f"Error while disconnecting {self.device_id}: {error}")
+        self._unregister_notify_handler()
 
     async def write_data(self, payload: bytes):
+        if not self.connected:
+            await self.reconnect()
         try:
-            while not self.connected:
-                logging.debug("Waiting to connect")
-                await self.reconnect()
             # noinspection PyUnresolvedReferences
             await self.fido_control_point.call_write_value(payload, {})
         except DBusError as error:
+            self._raise_if_gone(error)
             logging.error(f"Unable to write to {self.device_id}, error: {error}")
+            raise
+
+    def _unregister_notify_handler(self):
+        if self.notify_handler_registered:
+            # noinspection PyUnresolvedReferences
+            self.fido_status_notify_listen.off_properties_changed(self.handler)
+            self.notify_handler_registered = False
 
     async def listen_to_notify(self):
         if self.connected:
-            # noinspection PyUnresolvedReferences
-            self.fido_status_notify_listen.on_properties_changed(self.handler)
+            if not self.notify_handler_registered:
+                # noinspection PyUnresolvedReferences
+                self.fido_status_notify_listen.on_properties_changed(self.handler)
+                self.notify_handler_registered = True
             # noinspection PyUnresolvedReferences
             await self.fido_status.call_start_notify()
 
