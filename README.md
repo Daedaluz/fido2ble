@@ -6,8 +6,8 @@ Bridging FIDO2 BLE devices to the HID bus via /dev/uhid so they can be used in b
 Prebuilt packages are attached to each [release](https://github.com/Daedaluz/fido2ble/releases):
 
 * **Arch Linux**: `sudo pacman -U fido2ble-<version>-1-any.pkg.tar.zst`
-* **Debian** (trixie): `sudo apt install ./fido2ble_<version>~trixie_all.deb`
-* **Ubuntu** (resolute): `sudo apt install ./fido2ble_<version>~resolute_all.deb`
+* **Debian** (trixie): `sudo apt install ./fido2ble_<version>.trixie1_all.deb`
+* **Ubuntu** (resolute): `sudo apt install ./fido2ble_<version>.resolute1_all.deb`
 
 Then enable the service and pair your device (see [Pairing](#pairing)):
 
