@@ -1,0 +1,34 @@
+# Maintainer: Tobias Assarsson <tobias.assarsson@gmail.com>
+pkgname=fido2ble
+pkgver=0.3
+pkgrel=1
+pkgdesc="Proxy FIDO2 BLE authenticators to a virtual USB HID device (uhid) so browsers can use them"
+arch=(any)
+url="https://github.com/Daedaluz/fido2ble"
+license=(MIT)
+depends=(python bluez)
+makedepends=(python-build python-installer python-wheel python-setuptools)
+backup=(etc/default/fido2ble)
+# packaging/build-arch.sh drops a `git archive` of the tree under this name so
+# the package can be built before the tag exists on GitHub.
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  python -m unittest discover -s tests -t .
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 debian/fido2ble.service "$pkgdir/usr/lib/systemd/system/fido2ble.service"
+  install -Dm644 debian/fido2ble.default "$pkgdir/etc/default/fido2ble"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
+}

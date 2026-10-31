@@ -1,3 +1,16 @@
+fido2ble (0.3) unstable; urgency=medium
+
+  * Stop reconnecting to devices that were unpaired or removed from BlueZ
+    (closes: PoneBiometrics/fido2ble#33)
+  * Always answer the host with a CTAPHID error when the BLE device cannot be
+    connected or stops responding, so browsers no longer hang
+    (closes: PoneBiometrics/fido2ble#34)
+  * New options --connect-timeout, --response-timeout, --connect-attempts
+  * Drop the PoneBiometrics apt source and signing key from the package
+  * Build with pyproject.toml, run unit tests at build time
+
+ -- Tobias Assarsson <tobias.assarsson@gmail.com>  Fri, 31 Oct 2026 12:00:00 +0100
+
 fido2ble (0.2) UNRELEASED; urgency=medium
 
   * Added support for pairing while running

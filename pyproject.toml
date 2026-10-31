@@ -10,8 +10,11 @@ authors = [
   {name= "Magnus Ringerud", email = "mar@ponebiometrics.com"},
   {name= "Kacper Wysocki", email = "kacper@delta9.pl"},
 ]
-version = "0.2"
+version = "0.3"
 license = {text="MIT"}
 
 [project.scripts]
 fido2ble = "fido2ble.fido2ble:main"
+
+[tool.setuptools.packages.find]
+include = ["fido2ble*"]

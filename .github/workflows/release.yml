@@ -1,0 +1,47 @@
+name: Build packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  arch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: CONTAINER_RUNTIME=docker packaging/build-arch.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: arch, path: dist/* }
+
+  deb:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "docker.io/library/debian:trixie", suite: trixie }
+          - { image: "docker.io/library/ubuntu:resolute", suite: resolute }
+    steps:
+      - uses: actions/checkout@v4
+      - run: CONTAINER_RUNTIME=docker packaging/build-deb.sh "${{ matrix.image }}" "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@v4
+        with: { name: "deb-${{ matrix.suite }}", path: dist/* }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [arch, deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
