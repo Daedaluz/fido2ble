@@ -7,7 +7,7 @@ from random import randint
 from .vendored import uhid
 from .vendored.dbus_fast import DBusError
 
-from .CMD import CTAPHID_CAPABILITIES, CTAPHID_CMD, CTAPBLE_CMD
+from .CMD import CTAPHID_CAPABILITIES, CTAPHID_CMD, CTAPBLE_CMD, CTAP_STATUS
 from .CTAPBLEDevice import CTAPBLEDevice, DeviceUnavailableError
 
 # noinspection SpellCheckingInspection
@@ -15,6 +15,17 @@ CTAPHID_BROADCAST_CHANNEL = 0xFFFFFFFF
 
 DEFAULT_CONNECT_ATTEMPTS = 2
 """How many times to try (re)connecting the BLE link for one HID request."""
+
+DEFAULT_CONNECT_TIMEOUT = 15.0
+"""Seconds to wait for the BLE link to come up before answering with an error."""
+
+DEFAULT_RESPONSE_TIMEOUT = 30.0
+"""Seconds of BLE silence (no response, no keepalive) before answering with an error.
+
+CTAP over BLE requires the authenticator to send KEEPALIVE frames at least
+every 500 ms while it is busy or waiting for the user, so a healthy device
+never comes close to this.
+"""
 
 
 class CTAPHIDDevice:
@@ -42,10 +53,20 @@ class CTAPHIDDevice:
     reference_count = 0
     """Number of open handles to the device: clear state when it hits zero."""
 
-    def __init__(self, ble_device, connect_attempts: int = DEFAULT_CONNECT_ATTEMPTS):
+    def __init__(
+        self,
+        ble_device,
+        connect_attempts: int = DEFAULT_CONNECT_ATTEMPTS,
+        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        response_timeout: float = DEFAULT_RESPONSE_TIMEOUT,
+    ):
         # This could then also include the proper name, VID, PID and so on
         self.ble_device = ble_device
         self.connect_attempts = max(1, connect_attempts)
+        self.connect_timeout = connect_timeout
+        self.response_timeout = response_timeout
+        self.response_watchdog: asyncio.Task | None = None
+        self.last_ble_activity = 0.0
         # Per-device state. These used to be class attributes, i.e. shared
         # between all proxied devices.
         self.channels_to_state = {}
@@ -128,6 +149,7 @@ class CTAPHIDDevice:
         self.active_tasks = []
         if self.timeout_task and not self.timeout_task.done():
             self.timeout_task.cancel()
+        self.cancel_response_watchdog()
         try:
             self.device.destroy()
         except Exception as error:
@@ -148,7 +170,9 @@ class CTAPHIDDevice:
         # continuation = cmd_or_seq & 0x80 != 0
         cmd_or_seq = cmd_or_seq & 0x7F
         try:
-            if channel == CTAPHID_BROADCAST_CHANNEL and cmd_or_seq == CTAPHID_CMD.INIT:
+            # INIT is always a single packet: a new channel on the broadcast
+            # channel, or a resync of an existing one.
+            if cmd_or_seq == CTAPHID_CMD.INIT:
                 self.active_tasks.append(
                     asyncio.create_task(
                         self.handle_init(channel, received_data[7 : 7 + 8])
@@ -159,6 +183,29 @@ class CTAPHIDDevice:
         except BaseException as error:
             logging.warning(f"Error: {error}")
 
+    async def connect_ble(self) -> bool:
+        """Bring up the BLE link for a HID INIT. Returns False if it failed."""
+        try:
+            await asyncio.wait_for(
+                self.ble_device.connect(self.handle_ble_message), self.connect_timeout
+            )
+        except asyncio.TimeoutError:
+            logging.warning(
+                f"Unable to connect to {self.ble_device.device_id} within {self.connect_timeout}s"
+            )
+            return False
+        except asyncio.CancelledError as cancelError:
+            logging.warning(
+                f"Unable to connect to {self.ble_device.device_id}, cancelled: {cancelError}"
+            )
+            return False
+        except (DBusError, DeviceUnavailableError) as dbusError:
+            logging.warning(
+                f"Unable to connect to {self.ble_device.device_id}, error: {dbusError}"
+            )
+            return False
+        return True
+
     async def handle_init(self, channel, buffer: bytes):
         logging.debug(
             f"hid init: channel={'%X' % channel} buffer={buffer} device={self.device}"
@@ -168,19 +215,10 @@ class CTAPHIDDevice:
             # https://fidoalliance.org/specs/fido-v2.1-rd-20210309/fido-client-to-authenticator-protocol-v2.1-rd-20210309.html#usb-channels
             new_channel = randint(1, CTAPHID_BROADCAST_CHANNEL - 1)
 
-            try:
-                await self.ble_device.connect(self.handle_ble_message)
-            except asyncio.CancelledError as cancelError:
-                logging.warning(
-                    f"Unable to connect to {self.ble_device.device_id}, cancelled: {cancelError}"
-                )
-                # Failed to connect, we abort now
-                return
-            except (DBusError, DeviceUnavailableError) as dbusError:
-                logging.warning(
-                    f"Unable to connect to {self.ble_device.device_id}, error: {dbusError}"
-                )
-                # Failed to connect, we abort now
+            if not await self.connect_ble():
+                # Never leave the host hanging (issue #34): tell it the
+                # authenticator is not usable right now.
+                await self.send_error(CTAPHID_BROADCAST_CHANNEL, CTAP_STATUS.CTAP1_ERR_OTHER)
                 return
             self.channel = new_channel
             await self.send_init_reply(buffer, CTAPHID_BROADCAST_CHANNEL)
@@ -188,29 +226,24 @@ class CTAPHIDDevice:
 
             self.active_channel = new_channel
             self.channels_to_state[new_channel] = buffer
-        elif buffer == self.channels_to_state[channel]:
-            await self.send_init_reply(buffer, self.channel)
-            # ble_device = self.ble_device
+        elif channel in self.channels_to_state:
+            # INIT on an existing channel resynchronises it (new nonce).
+            self.channels_to_state[channel] = buffer
+            self.channel = channel
+            await self.send_init_reply(buffer, channel)
 
-            # if ble_device is None:
-            #    return None
-
-            try:
-                await self.ble_device.connect(self.handle_ble_message)
-            except asyncio.CancelledError as cancelError:
-                logging.warning(
-                    f"Unable to connect to {self.ble_device.device_id}, cancelled: {cancelError}"
-                )
-                # Failed to connect, we abort now
-                return
-            except (DBusError, DeviceUnavailableError) as dbusError:
-                logging.warning(
-                    f"Unable to connect to {self.ble_device.device_id}, error: {dbusError}"
-                )
-                # Failed to connect, we abort now
+            if not await self.connect_ble():
+                await self.send_error(channel, CTAP_STATUS.CTAP1_ERR_OTHER)
                 return
             self.active_channel = channel
+        else:
+            await self.send_error(channel, CTAP_STATUS.CTAP1_ERR_INVALID_CHANNEL)
+            return
         self.setup_timeout()
+
+    async def send_error(self, channel: int, code: CTAP_STATUS):
+        logging.debug(f"hid error: channel={'%X' % channel} code={code.name}")
+        await self.send_hid_message(CTAPHID_CMD.ERROR, bytes([code]), channel=channel)
 
     async def send_init_reply(self, nonce: bytes, channel: int):
         await self.send_hid_message(
@@ -318,14 +351,17 @@ class CTAPHIDDevice:
         try:
             connected_ble_device = await self.ensure_connected()
             if connected_ble_device is None:
+                await self.send_error(channel, CTAP_STATUS.CTAP1_ERR_OTHER)
                 return
             self.setup_timeout()
 
             if self.hid_command == CTAPHID_CMD.CBOR:
+                self.start_response_watchdog(channel)
                 await connected_ble_device.send_ble_message(
                     CTAPBLE_CMD.MSG, self.hid_buffer
                 )
             elif self.hid_command == CTAPHID_CMD.CANCEL:
+                self.cancel_response_watchdog()
                 await connected_ble_device.send_ble_message(
                     CTAPBLE_CMD.CANCEL, self.hid_buffer
                 )
@@ -339,6 +375,7 @@ class CTAPHIDDevice:
                     CTAPBLE_CMD.ERROR, self.hid_buffer
                 )
             elif self.hid_command == CTAPHID_CMD.PING:
+                self.start_response_watchdog(channel)
                 await connected_ble_device.send_ble_message(
                     CTAPBLE_CMD.PING, self.hid_buffer
                 )
@@ -348,12 +385,51 @@ class CTAPHIDDevice:
                 CTAPHID_CMD.MSG,
                 CTAPHID_CMD.LOCK,
             ):
-                # TODO
-                pass
+                # Not supported over BLE; CTAPHID_INIT is handled in handle_init.
+                await self.send_error(channel, CTAP_STATUS.CTAP1_ERR_INVALID_COMMAND)
         except Exception as error:
             logging.warning(f"Error during hid_finish_receiving, error={error}")
+            self.cancel_response_watchdog()
+            try:
+                await self.send_error(channel, CTAP_STATUS.CTAP1_ERR_OTHER)
+            except Exception as send_error:
+                logging.warning(f"Unable to report error to host: {send_error}")
+
+    def start_response_watchdog(self, channel: int):
+        """Answer the host with an error if the BLE device goes silent (issue #34)."""
+        self.cancel_response_watchdog()
+        self.touch_ble_activity()
+        self.response_watchdog = asyncio.create_task(
+            self._response_watchdog(channel), name="response_watchdog"
+        )
+
+    def cancel_response_watchdog(self):
+        if self.response_watchdog and not self.response_watchdog.done():
+            self.response_watchdog.cancel()
+        self.response_watchdog = None
+
+    def touch_ble_activity(self):
+        self.last_ble_activity = asyncio.get_running_loop().time()
+
+    async def _response_watchdog(self, channel: int):
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining = self.response_timeout - (loop.time() - self.last_ble_activity)
+            if remaining <= 0:
+                break
+            await asyncio.sleep(remaining)
+        logging.warning(
+            f"No response from {self.ble_device.device_id} for {self.response_timeout}s, reporting timeout to host"
+        )
+        self.response_watchdog = None
+        await self.send_error(channel, CTAP_STATUS.CTAP1_ERR_TIMEOUT)
+        try:
+            await self.ble_device.send_ble_message(CTAPBLE_CMD.CANCEL, b"")
+        except Exception as error:
+            logging.debug(f"Unable to cancel on {self.ble_device.device_id}: {error}")
 
     def handle_ble_message(self, payload):
+        self.touch_ble_activity()
         (cmd_or_seq,) = struct.unpack(">B", payload[0:1])
         continuation = cmd_or_seq & 0x80 == 0
         cmd_or_seq = cmd_or_seq  # no adding of & 0x7F, as the command definitions include 0x80 for some reason in BLE
@@ -380,6 +456,9 @@ class CTAPHIDDevice:
             f"ble rx: command={self.ble_command.name} payload={self.ble_buffer.hex()} device={self.ble_device.device_id}"
         )
         self.ble_device.keep_alive()
+        if self.ble_command != CTAPBLE_CMD.KEEPALIVE:
+            # Any final frame ends the transaction the watchdog was guarding.
+            self.cancel_response_watchdog()
         if self.ble_command == CTAPBLE_CMD.MSG:
             await self.send_hid_message(CTAPHID_CMD.CBOR, self.ble_buffer)
         elif self.ble_command == CTAPBLE_CMD.KEEPALIVE:

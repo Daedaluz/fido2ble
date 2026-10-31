@@ -60,6 +60,10 @@ class CTAP_STATUS(enum.IntEnum):
 
     CTAP1_ERR_INVALID_SEQ = 0x04
     """Invalid message sequencing."""
+    CTAP1_ERR_TIMEOUT = 0x05
+    """Message has timed out."""
+    CTAP1_ERR_CHANNEL_BUSY = 0x06
+    """Channel busy. Client SHOULD retry the request after a short delay."""
     CTAP1_ERR_INVALID_CHANNEL = 0x0B
     """Command not allowed on this cid."""
 

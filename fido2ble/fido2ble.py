@@ -9,7 +9,12 @@ from .vendored.dbus_fast import BusType
 from .vendored.dbus_fast.aio import MessageBus
 
 from .CTAPBLEDevice import CTAPBLEDevice, find_characteristics
-from .CTAPHIDDevice import CTAPHIDDevice
+from .CTAPHIDDevice import (
+    CTAPHIDDevice,
+    DEFAULT_CONNECT_ATTEMPTS,
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_RESPONSE_TIMEOUT,
+)
 
 FIDO_SERVICE_UUID = "0000fffd-0000-1000-8000-00805f9b34fb"
 FIDO_CONTROL_POINT_UUID = "f1d0fff1-deaa-ecee-b42f-c9ba7ed623bb"
@@ -22,6 +27,8 @@ PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 
 fido_devices: dict[str, CTAPBLEDevice]
 hid_devices: dict[str, CTAPHIDDevice]
+hid_options: dict = {}
+"""Keyword arguments passed to every CTAPHIDDevice (timeouts, retries)."""
 
 
 async def device_properties_changed(path, interface, changed, invalidated):
@@ -191,7 +198,7 @@ async def update_fido_devices():
     fido_devices = await find_fido()
     for fido_device in fido_devices:
         if fido_device not in hid_devices:
-            hid = CTAPHIDDevice(fido_devices[fido_device])
+            hid = CTAPHIDDevice(fido_devices[fido_device], **hid_options)
             asyncio.create_task(hid.start())
             hid_devices[fido_device] = hid
 
@@ -222,7 +229,34 @@ def main():
         help="log level of uhid device, either debug, info, warn or error",
     )
 
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=DEFAULT_CONNECT_TIMEOUT,
+        metavar="SECONDS",
+        help="how long to wait for the BLE device to connect before reporting an error to the host (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--response-timeout",
+        type=float,
+        default=DEFAULT_RESPONSE_TIMEOUT,
+        metavar="SECONDS",
+        help="how long the BLE device may stay silent (no response or keepalive) before reporting a timeout to the host (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--connect-attempts",
+        type=int,
+        default=DEFAULT_CONNECT_ATTEMPTS,
+        metavar="N",
+        help="how many times to try reconnecting the BLE link for one request (default: %(default)s)",
+    )
+
     args = parser.parse_args()
+    hid_options.update(
+        connect_timeout=args.connect_timeout,
+        response_timeout=args.response_timeout,
+        connect_attempts=args.connect_attempts,
+    )
 
     loglevel = logging.WARNING
     if args.log_level == "debug":

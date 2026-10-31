@@ -28,6 +28,19 @@ The above needs some elevated privileges, either through running as root, sudo o
 The code can also be built as a debian package and installed that way. It requires a minimum of Debian Bullseye (11) or Ubuntu Manic Minotaur (23) to build and install. 
 Running `debuild` in the base folder will create the needed files. 
 
+### Timeouts
+
+The proxy never leaves the host waiting on an unresponsive BLE device: if the
+device cannot be connected, or stops sending responses and keepalives, the
+request is answered with a CTAPHID error so browsers can move on. The limits
+can be tuned (for example via `DAEMON_ARGS` in `/etc/default/fido2ble`):
+
+```
+--connect-timeout SECONDS   wait this long for the BLE link (default 15)
+--response-timeout SECONDS  tolerate this much BLE silence (default 30)
+--connect-attempts N        reconnect attempts per request (default 2)
+```
+
 ## Verifying that it runs
 The system can be verified to work through either [libfido2](https://github.com/Yubico/libfido2) or just testing it in a browser. Below is an example of how this would be done 
 ```
