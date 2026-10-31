@@ -28,9 +28,12 @@ git -C "$repo" archive --format=tar HEAD | tar -x -C "$work"
       build-essential debhelper dh-python pybuild-plugin-pyproject \
       python3-all python3-setuptools devscripts fakeroot >/dev/null
     cd /build/fido2ble
-    version=$(dpkg-parsechangelog -S Version)
+    # Sign the suite-specific changelog entry as the package maintainer.
+    export DEBFULLNAME=$(dpkg-parsechangelog -S Maintainer | sed "s/ <.*//")
+    export DEBEMAIL=$(dpkg-parsechangelog -S Maintainer | sed "s/.*<\(.*\)>/\1/")
     dch --local "~$SUITE" --distribution "$SUITE" "Build for $SUITE."
     dpkg-buildpackage -us -uc -b
     cp ../*.deb ../*.buildinfo ../*.changes /out/
+    chown -R "$(stat -c %u:%g /out)" /build /out
     ls -l /out
   '

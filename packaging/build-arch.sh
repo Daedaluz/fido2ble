@@ -25,5 +25,7 @@ git -C "$repo" archive --format=tar.gz --prefix="fido2ble-$pkgver/" -o "$work/fi
     # bluez is a runtime dependency only; -d skips installing it in the container.
     sudo -u builder makepkg -f -d
     cp /build/*.pkg.tar.zst /out/
+    # Hand the build tree back to the host user so the temp dir can be removed.
+    chown -R "$(stat -c %u:%g /out)" /build /out
     ls -l /out
   '

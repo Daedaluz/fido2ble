@@ -3,9 +3,31 @@ Bridging FIDO2 BLE devices to the HID bus via /dev/uhid so they can be used in b
 
 ## Installation
 
-The easiest way to install is by using the `.deb` from the [releases](https://github.com/PoneBiometrics/fido2ble/releases) page. This can the be installed through `apt install`. This will then add the release page to the repositores and it can then be updated through `apt update && apt upgrade`
+Prebuilt packages are attached to each [release](https://github.com/Daedaluz/fido2ble/releases):
 
-The second option would be to running it manually from the reposistory as instructed below.
+* **Arch Linux**: `sudo pacman -U fido2ble-<version>-1-any.pkg.tar.zst`
+* **Debian** (trixie): `sudo apt install ./fido2ble_<version>~trixie_all.deb`
+* **Ubuntu** (resolute): `sudo apt install ./fido2ble_<version>~resolute_all.deb`
+
+Then enable the service and pair your device (see [Pairing](#pairing)):
+
+```
+sudo systemctl enable --now fido2ble
+```
+
+This is a fork of [PoneBiometrics/fido2ble](https://github.com/PoneBiometrics/fido2ble)
+with fixes for devices that are unpaired while the service runs and for
+browsers hanging on an unresponsive device. It does not add any apt repository.
+
+The packages are built in containers by the scripts in `packaging/`:
+
+```
+packaging/build-arch.sh
+packaging/build-deb.sh docker.io/library/debian:trixie trixie
+packaging/build-deb.sh docker.io/library/ubuntu:resolute resolute
+```
+
+The second option would be to running it manually from the repository as instructed below.
 
 ## Dependencies on debian-based systems
 
